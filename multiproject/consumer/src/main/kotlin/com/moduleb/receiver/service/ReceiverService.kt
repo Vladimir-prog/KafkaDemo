@@ -1,8 +1,8 @@
 package com.moduleb.receiver.service
 
-import com.moduleb.receiver.*
-import com.moduleb.receiver.config.ProducerConfig.Companion.topic
 import com.moduleb.receiver.config.ConsumerConfig
+import com.moduleb.receiver.config.ProducerConfig.Companion.topic
+import com.moduleb.receiver.jsonMapper
 import com.moduleb.receiver.model.Message
 import com.moduleb.receiver.model.Request
 import com.moduleb.receiver.repo.MessageRepository
@@ -11,19 +11,37 @@ import org.apache.kafka.clients.producer.ProducerRecord
 import org.slf4j.LoggerFactory
 import org.springframework.kafka.annotation.KafkaListener
 import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
 import java.time.LocalDateTime
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantLock
 
 @Service
-class ReceiverService(private val msgRepo: MessageRepository,
-                      private val prod: Producer<String, String>
+class ReceiverService(
+    private val msgRepo: MessageRepository,
+    private val prod: Producer<String, String>
 ) {
     private val logger = LoggerFactory.getLogger(ReceiverService::class.java)
+    private val set = ConcurrentHashMap.newKeySet<Long>()
+    private val lock = ReentrantLock()
 
     @KafkaListener(topics = [ConsumerConfig.TOPIC], groupId = "b_module_consumer")
     fun receive(msg: String) {
         logger.info("RECEIVED REQUEST $msg FROM TOPIC $topic")
-
         val request = jsonMapper.readValue(msg, Request::class.java)
+
+        lock.lock()
+        try {
+            if (set.contains(request.id) || msgRepo.findById(request.id).isPresent) {
+                return
+            }
+            set.add(request.id)
+        } catch (ex: Exception) {
+            logger.error("error: ", ex)
+            return
+        } finally {
+            lock.unlock()
+        }
 
         //TODO Consider simplifying: findTimeById(msgRepo.findTopByOrderByIdDesc()?.id) => findTopByOrderBySentDesc().sent
         // if the last request == the one made lately
@@ -32,7 +50,16 @@ class ReceiverService(private val msgRepo: MessageRepository,
         //gets the last record for now => will be previous record after saving the received one
         val previousId = msgRepo.findTopByOrderByIdDesc()?.id ?: -1
 
-        msgRepo.save(Message(sent = request.sent, id = request.id))
+        try {
+            save(Message(sent = request.sent, id = request.id))
+        } catch (ex: Exception) {
+            logger.error("error: ", ex)
+        } finally {
+            set.remove(request.id)
+        }
+
+        // TODO здесь проблема при многопоточке. например: два треда вычитывают одинаковый пред. ид и отправят его два раза в очередь
+        //  при том эти же два треда сохраняют свои энтити и при след вычитки предыдущего запроса потеряется одна запись
 
         if (previousId != -1L) {
             val previousMessageTime = msgRepo.findTimeById(previousId)
@@ -43,4 +70,10 @@ class ReceiverService(private val msgRepo: MessageRepository,
             prod.send(ProducerRecord(topic, jsonMapper.writeValueAsString(LocalDateTime.MIN)))
         }
     }
+
+    @Transactional
+    private fun save(message: Message) {
+        msgRepo.save(message)
+    }
+
 }
